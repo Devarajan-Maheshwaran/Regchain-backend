@@ -1,23 +1,28 @@
-const { expect } = require("chai");
-const { ethers } = require("hardhat");
+import { expect } from "chai";
+import hre from "hardhat";
+import { keccak256, toUtf8Bytes } from "ethers/lib/utils";
+import "@nomicfoundation/hardhat-chai-matchers";
 
 describe("RegChainAccess Contract", function () {
-  let RegChain, regChain, issuer, owner, verifier;
+  let regChain: any;
+  let issuer: any;
+  let owner: any;
+  let verifier: any;
 
   beforeEach(async function () {
+    const ethers = hre.ethers;
     [issuer, owner, verifier] = await ethers.getSigners();
 
-    RegChain = await ethers.getContractFactory("RegChainAccess");
+    const RegChain = await ethers.getContractFactory("RegChainAccess");
     regChain = await RegChain.deploy(issuer.address);
     await regChain.deployed();
 
-    // Give issuer role to issuer account
     const ISSUER_ROLE = await regChain.ISSUER_ROLE();
     await regChain.connect(issuer).grantRole(ISSUER_ROLE, issuer.address);
   });
 
   it("Only issuer can register documents", async function () {
-    const hash = ethers.utils.keccak256(ethers.utils.toUtf8Bytes("doc1"));
+    const hash = keccak256(toUtf8Bytes("doc1"));
     const pointer = "ipfs://Qm...";
 
     await expect(
@@ -30,7 +35,7 @@ describe("RegChainAccess Contract", function () {
   });
 
   it("Owner can grant and revoke access to verifier", async function () {
-    const hash = ethers.utils.keccak256(ethers.utils.toUtf8Bytes("doc2"));
+    const hash = keccak256(toUtf8Bytes("doc2"));
     const pointer = "ipfs://Qm...";
 
     await regChain.connect(issuer).registerDocumentFor(hash, owner.address, pointer);
