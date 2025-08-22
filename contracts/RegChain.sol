@@ -1,197 +1,93 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.0;
+import "@openzeppelin/contracts/access/AccessControl.sol";
 
-/**
- * RegChain — Government-issued document registry (BNB Testnet)
- *
- * Core ideas:
- * - Government/issuer registers doc hash for a citizen (owner).
- * - Only hash + minimal metadata on-chain (immutable integrity anchor).
- * - Owner/issuer can grant/revoke view access to specific wallets.
- * - Optional per-viewer encrypted key blob is stored to enable decryption.
- *
- * Storage pointers:
- * - `uri` should point to BNB Greenfield object (or IPFS fallback).
- *
- * Security:
- * - Document bytes are never on-chain.
- * - Viewers read `canView` on-chain, fetch ciphertext from storage,
- *   then decrypt using an off-chain key derived from `viewerEncKey`.
- */
+contract RegChainAccess is AccessControl {
+    bytes32 public constant ISSUER_ROLE = keccak256("ISSUER_ROLE");
 
-interface IAccessControlLite {
-    function hasRole(bytes32 role, address account) external view returns (bool);
-}
-
-abstract contract AccessControlSimple {
-    mapping(bytes32 => mapping(address => bool)) private _roles;
-
-    bytes32 public constant DEFAULT_ADMIN_ROLE = 0x00;
-
-    event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender);
-    event RoleRevoked(bytes32 indexed role, address indexed account, address indexed sender);
-
-    modifier onlyRole(bytes32 role) {
-        require(_roles[role][msg.sender], "ACCESS_DENIED");
-        _;
-    }
-
-    constructor() {
-        _roles[DEFAULT_ADMIN_ROLE][msg.sender] = true;
-        emit RoleGranted(DEFAULT_ADMIN_ROLE, msg.sender, msg.sender);
-    }
-
-    function hasRole(bytes32 role, address account) public view returns (bool) {
-        return _roles[role][account];
-    }
-
-    function grantRole(bytes32 role, address account) public onlyRole(DEFAULT_ADMIN_ROLE) {
-        _roles[role][account] = true;
-        emit RoleGranted(role, account, msg.sender);
-    }
-
-    function revokeRole(bytes32 role, address account) public onlyRole(DEFAULT_ADMIN_ROLE) {
-        _roles[role][account] = false;
-        emit RoleRevoked(role, account, msg.sender);
-    }
-}
-
-contract RegChain is AccessControlSimple {
-    // --- Roles ---
-    bytes32 public constant ISSUER_ROLE = keccak256("ISSUER_ROLE"); // government / authorized issuer
-
-    // --- Data structures ---
     struct Document {
-        // immutable identity for the file content
-        bytes32 hash;          // SHA-256 of the file
-        address owner;         // citizen wallet
-        string  uri;           // storage pointer (Greenfield object / IPFS CID)
-        uint64  createdAt;     // block timestamp (cast)
+        address owner;
+        address issuer;
+        string pointer; // off-chain file location (BNB Greenfield/IPFS/URL)
+        mapping(address => string) viewerKey; // verifier => encrypted key
+        mapping(address => bool) allowedViewers;
     }
 
-    // docHash -> Document
-    mapping(bytes32 => Document) private _docs;
-    // owner -> list of their doc hashes
-    mapping(address => bytes32[]) private _ownerDocs;
+    mapping(bytes32 => Document) private documents;
+    mapping(address => bytes32[]) private ownerDocs;
 
-    // docHash -> viewer -> access granted?
-    mapping(bytes32 => mapping(address => bool)) private _canView;
+    event DocumentRegistered(address indexed issuer, address indexed owner, bytes32 indexed docHash, string pointer);
+    event AccessGranted(bytes32 docHash, address indexed owner, address indexed viewer, string viewerKey);
+    event AccessRevoked(bytes32 docHash, address indexed owner, address indexed viewer);
 
-    // OPTIONAL: docHash -> viewer -> encrypted symmetric key (e.g., AES key wrapped to viewer's pubkey)
-    mapping(bytes32 => mapping(address => bytes)) private _viewerEncKey;
-
-    // --- Events ---
-    event DocumentRegistered(address indexed issuer, address indexed owner, bytes32 indexed docHash, string uri);
-    event AccessGranted(bytes32 indexed docHash, address indexed viewer, bytes encKey);
-    event AccessRevoked(bytes32 indexed docHash, address indexed viewer);
-
-    // --- Modifiers ---
-    modifier onlyOwnerOrIssuer(bytes32 docHash) {
-        address owner = _docs[docHash].owner;
-        require(owner != address(0), "DOC_NOT_FOUND");
-        require(msg.sender == owner || hasRole(ISSUER_ROLE, msg.sender), "NOT_OWNER_OR_ISSUER");
-        _;
+    constructor(address admin) {
+        _setupRole(DEFAULT_ADMIN_ROLE, admin);
     }
 
-    // --- Core: registration by issuer ---
-    /**
-     * @notice Register a document for a citizen. Issuer-only.
-     * @param owner  The wallet that should own this document.
-     * @param docHash SHA-256 of the document bytes.
-     * @param uri Storage pointer to the encrypted file (Greenfield preferred).
-     */
-    function registerDocumentFor(address owner, bytes32 docHash, string calldata uri)
-        external
-        onlyRole(ISSUER_ROLE)
+    // ISSUER registers a document for the citizen (owner)
+    function registerDocumentFor(bytes32 docHash, address owner, string calldata pointer)
+        external onlyRole(ISSUER_ROLE)
     {
-        require(owner != address(0), "BAD_OWNER");
-        require(docHash != bytes32(0), "BAD_HASH");
-        require(_docs[docHash].owner == address(0), "ALREADY_REGISTERED");
-
-        _docs[docHash] = Document({
-            hash: docHash,
-            owner: owner,
-            uri: uri,
-            createdAt: uint64(block.timestamp)
-        });
-
-        _ownerDocs[owner].push(docHash);
-
-        emit DocumentRegistered(msg.sender, owner, docHash, uri);
+        require(docHash != 0, "Invalid hash");
+        Document storage doc = documents[docHash];
+        require(doc.owner == address(0), "Already registered");
+        doc.owner = owner;
+        doc.issuer = msg.sender;
+        doc.pointer = pointer;
+        ownerDocs[owner].push(docHash);
+        emit DocumentRegistered(msg.sender, owner, docHash, pointer);
     }
 
-    // --- Access control for viewers ---
-    /**
-     * @notice Grant viewer access to a document. Caller: owner or issuer.
-     * @param docHash Document hash.
-     * @param viewer  Wallet allowed to view.
-     * @param encKey  Optional encrypted key material for the viewer (can be empty).
-     */
-    function grantAccess(bytes32 docHash, address viewer, bytes calldata encKey)
+    // OWNER grants access to a verifier with encrypted key
+    function grantAccess(bytes32 docHash, address viewer, string calldata viewerKey)
         external
-        onlyOwnerOrIssuer(docHash)
     {
-        require(viewer != address(0), "BAD_VIEWER");
-        _canView[docHash][viewer] = true;
-        if (encKey.length > 0) {
-            _viewerEncKey[docHash][viewer] = encKey;
-        }
-        emit AccessGranted(docHash, viewer, encKey);
+        Document storage doc = documents[docHash];
+        require(doc.owner == msg.sender, "Not owner");
+        doc.allowedViewers[viewer] = true;
+        doc.viewerKey[viewer] = viewerKey;
+        emit AccessGranted(docHash, msg.sender, viewer, viewerKey);
     }
 
-    /**
-     * @notice Revoke viewer access. Caller: owner or issuer.
-     */
+    // OWNER revokes access for a verifier
     function revokeAccess(bytes32 docHash, address viewer)
         external
-        onlyOwnerOrIssuer(docHash)
     {
-        _canView[docHash][viewer] = false;
-        delete _viewerEncKey[docHash][viewer];
-        emit AccessRevoked(docHash, viewer);
+        Document storage doc = documents[docHash];
+        require(doc.owner == msg.sender, "Not owner");
+        doc.allowedViewers[viewer] = false;
+        doc.viewerKey[viewer] = "";
+        emit AccessRevoked(docHash, msg.sender, viewer);
     }
 
-    // --- Read functions ---
+    // Anyone can verify document integrity
     function verifyDocument(bytes32 docHash) external view returns (bool) {
-        return _docs[docHash].owner != address(0);
+        return documents[docHash].owner != address(0);
     }
 
-    function getDocuments(address owner) external view returns (bytes32[] memory) {
-        return _ownerDocs[owner];
-    }
-
-    function ownerOf(bytes32 docHash) external view returns (address) {
-        return _docs[docHash].owner;
-    }
-
-    function getDocument(bytes32 docHash)
-        external
-        view
-        returns (bytes32 hash, address owner, string memory uri, uint64 createdAt)
+    // Get doc info (pointer, owner, issuer)
+    function getDocumentInfo(bytes32 docHash) external view returns
+        (address, address, string memory)
     {
-        Document memory d = _docs[docHash];
-        require(d.owner != address(0), "DOC_NOT_FOUND");
-        return (d.hash, d.owner, d.uri, d.createdAt);
+        Document storage doc = documents[docHash];
+        return (doc.owner, doc.issuer, doc.pointer);
     }
 
-    /**
-     * @notice Check if `viewer` currently has access.
-     */
-    function canView(bytes32 docHash, address viewer) external view returns (bool) {
-        return _canView[docHash][viewer];
+    // Owner can list their documents
+    function getDocumentsByOwner(address owner)
+        external view returns (bytes32[] memory)
+    {
+        return ownerDocs[owner];
     }
 
-    /**
-     * @notice Fetch the encrypted key blob for `viewer`.
-     *         Only the viewer, the owner, or an issuer can read it.
-     */
-    function getViewerEncKey(bytes32 docHash, address viewer) external view returns (bytes memory) {
-        address owner = _docs[docHash].owner;
-        require(owner != address(0), "DOC_NOT_FOUND");
-        require(
-            msg.sender == viewer || msg.sender == owner || hasRole(ISSUER_ROLE, msg.sender),
-            "FORBIDDEN"
-        );
-        return _viewerEncKey[docHash][viewer];
+    // Verifier checks if they have access and gets their encrypted viewing key blob
+    function getViewerKey(bytes32 docHash, address viewer)
+        external view returns (string memory)
+    {
+        Document storage doc = documents[docHash];
+        if (doc.allowedViewers[viewer]) {
+            return doc.viewerKey[viewer];
+        }
+        return "";
     }
 }
